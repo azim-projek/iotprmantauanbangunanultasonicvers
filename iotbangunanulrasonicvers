@@ -2,22 +2,22 @@
  * Project: Smart Building Monitor (Ultrasonic + MPU6050)
  * 
  * Description:
- * This IoT-based system monitors both the distance and tilt of a 
- * structure or object in real-time. It provides alerts via a buzzer 
- * and Telegram messages if abnormal conditions are detected.
+ * This IoT-based system monitors both the distance (in mm) and tilt of a 
+ * structure or object in real-time. It provides alerts via Telegram 
+ * messages if abnormal conditions are detected.
  * 
  * Components:
  * 1. ESP32 Microcontroller - main controller, handles sensors and WiFi.
  * 2. Ultrasonic Sensor (HC-SR04) - measures distance to object.
  * 3. MPU6050 - accelerometer and gyroscope to detect tilt.
- * 4. Buzzer - provides audible alerts for warning or critical states.
- * 5. WiFi + Telegram Bot - sends instant notifications to the user.
-
+ * 4. WiFi + Telegram Bot - sends instant notifications to the user.
+**********************************************************************/
 #include <Wire.h>
 #include <MPU6050.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
+#include "time.h"
 
 // === Hardware Objects ===
 MPU6050 mpu;
@@ -25,22 +25,26 @@ MPU6050 mpu;
 // === Pins ===
 #define TRIG_PIN 5
 #define ECHO_PIN 18
-#define BUZZER_PIN 25
 
 // === WiFi & Telegram Config ===
-const char* WIFI_SSID = "realme GT NEO 3";
-const char* WIFI_PASS = "miskinsangatke";
-#define BOT_TOKEN "7709722010:AAE6EH3DVak6my5Az8AX-v1g_iMTekHJkCs"
-const char* CHAT_ID = "1034103142";
+const char* WIFI_SSID = "iPhone";
+const char* WIFI_PASS = "12345678";
+#define BOT_TOKEN "8488772079:AAE6CcS_jfcCRA6JuHZUn_ri2yGDR5nU11I"
+const char* CHAT_ID = "1215468213";
 
 WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
 
-// === Thresholds ===
-const float DIST_WARNING_CM = 57.0;  // Warning if closer than 57 cm
-const float DIST_CRITICAL_CM = 52.0; // Critical if closer than 52 cm
-const float TILT_MIN_NORMAL = 82.0;  // Tilt normal lower bound
-const float TILT_MAX_NORMAL = 87.0;  // Tilt normal upper bound
+// === NTP / Time Config ===
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 28800; // Malaysia GMT+8
+const int daylightOffset_sec = 0;
+
+// === Thresholds in mm ===
+const float DIST_WARNING_MM = 570;  // 57 cm -> 570 mm
+const float DIST_CRITICAL_MM = 520; // 52 cm -> 520 mm
+const float TILT_MIN_NORMAL = 82.0; // Tilt normal lower bound
+const float TILT_MAX_NORMAL = 87.0; // Tilt normal upper bound
 
 // === States ===
 enum AlertLevel { NORMAL, WARNING, CRITICAL };
@@ -49,7 +53,7 @@ AlertLevel currentAlert = NORMAL;
 // Timer for periodic Telegram
 unsigned long lastTelegramTime = 0;
 const unsigned long TELEGRAM_INTERVAL = 60000; // 60 sec
-const unsigned long ALERT_COOLDOWN = 10000;    // 10 sec min between messages
+const unsigned long ALERT_COOLDOWN = 10000;    // 10 sec
 
 // === Moving Average for Distance ===
 #define FILTER_SIZE 5
@@ -57,38 +61,23 @@ float distanceBuffer[FILTER_SIZE];
 int filterIndex = 0;
 bool bufferFilled = false;
 
-// === Buzzer Pattern ===
-unsigned long buzzerTimer = 0;
-bool buzzerState = false;
+// === Function Prototypes ===
+void sendTelegram(String msg);
+float getUltrasonicDistanceMM();
+float getTiltDeg();
+float movingAverage(float newValue);
+void ensureWiFi();
+String getCurrentTime();
 
-// === Helpers ===
-void buzzerPattern(AlertLevel level) {
-    unsigned long now = millis();
-    int interval = 0;
-
-    if (level == WARNING) interval = 400;
-    else if (level == CRITICAL) interval = 200;
-    else {
-        digitalWrite(BUZZER_PIN, LOW);
-        buzzerState = false;
-        return;
-    }
-
-    if (now - buzzerTimer >= interval) {
-        buzzerTimer = now;
-        buzzerState = !buzzerState;
-        digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
-    }
-}
-
+// ====================== Functions ======================
 void sendTelegram(String msg) {
     Serial.println("📲 Sending Telegram...");
     if (bot.sendMessage(CHAT_ID, msg, "")) Serial.println("✅ Sent");
     else Serial.println("❌ Failed");
 }
 
-// --- Ultrasonic Measurement ---
-float getUltrasonicDistanceCM() {
+// Ultrasonic distance in mm
+float getUltrasonicDistanceMM() {
     digitalWrite(TRIG_PIN, LOW);
     delayMicroseconds(2);
     digitalWrite(TRIG_PIN, HIGH);
@@ -96,11 +85,12 @@ float getUltrasonicDistanceCM() {
     digitalWrite(TRIG_PIN, LOW);
 
     long duration = pulseIn(ECHO_PIN, HIGH, 30000); // timeout 30ms (~5m)
-    float distance = duration * 0.0343 / 2; // cm
+    float distance = duration * 0.343 / 2; // mm
     if (duration == 0) return -1; // no reading
     return distance;
 }
 
+// Tilt in degrees
 float getTiltDeg() {
     int16_t ax, ay, az, gx, gy, gz;
     mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
@@ -112,6 +102,7 @@ float getTiltDeg() {
     return max(abs(roll), abs(pitch));
 }
 
+// Moving average filter
 float movingAverage(float newValue) {
     distanceBuffer[filterIndex] = newValue;
     filterIndex = (filterIndex + 1) % FILTER_SIZE;
@@ -123,6 +114,7 @@ float movingAverage(float newValue) {
     return sum / count;
 }
 
+// Ensure WiFi connection
 void ensureWiFi() {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("🔄 Reconnecting WiFi...");
@@ -137,21 +129,28 @@ void ensureWiFi() {
     }
 }
 
+// Get current time HH:MM:SS
+String getCurrentTime() {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) return "00:00:00";
+    char buffer[9];
+    strftime(buffer, 9, "%H:%M:%S", &timeinfo);
+    return String(buffer);
+}
+
+// ====================== Setup ======================
 void setup() {
     Serial.begin(115200);
     delay(1000);
     Wire.begin(21, 22);
 
-    // Ultrasonic
+    // Ultrasonic pins
     pinMode(TRIG_PIN, OUTPUT);
     pinMode(ECHO_PIN, INPUT);
 
     // MPU6050
     mpu.initialize();
     Serial.println(mpu.testConnection() ? "✅ MPU6050 OK" : "❌ MPU6050 not found");
-
-    pinMode(BUZZER_PIN, OUTPUT);
-    digitalWrite(BUZZER_PIN, LOW);
 
     // WiFi
     Serial.println("Connecting WiFi...");
@@ -163,39 +162,37 @@ void setup() {
     Serial.println("\n✅ WiFi connected");
     client.setInsecure();
 
+    // NTP time
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    Serial.println("⏱️ Time synchronized via NTP");
+
     sendTelegram("🏗️ Smart Building Monitor (Ultrasonic) started ✅");
 }
 
+// ====================== Loop ======================
 void loop() {
     ensureWiFi();
 
     // --- Distance Measurement ---
-    float raw_distance = getUltrasonicDistanceCM();
-    float distance_cm = (raw_distance > 0) ? movingAverage(raw_distance) : -1;
+    float raw_distance = getUltrasonicDistanceMM();
+    float distance_mm = (raw_distance > 0) ? movingAverage(raw_distance) : -1;
 
     // --- Tilt Measurement ---
     float tilt = getTiltDeg();
 
-    // Debug print
+    // --- Debug print ---
     Serial.print("📏 Distance: ");
-    if (distance_cm > 0) Serial.print(distance_cm);
+    if (distance_mm > 0) Serial.print(distance_mm);
     else Serial.print("Out of range");
-    Serial.print(" cm | 📐 Tilt: "); Serial.println(tilt);
+    Serial.print(" mm | 📐 Tilt: "); Serial.println(tilt);
 
     // --- Alert Logic ---
     AlertLevel newAlert = NORMAL;
-
-    if (distance_cm > 0) {
-        if (distance_cm < DIST_CRITICAL_CM) {
-            newAlert = CRITICAL;
-        } else if (distance_cm < DIST_WARNING_CM) {
-            newAlert = WARNING;
-        }
+    if (distance_mm > 0) {
+        if (distance_mm < DIST_CRITICAL_MM) newAlert = CRITICAL;
+        else if (distance_mm < DIST_WARNING_MM) newAlert = WARNING;
     }
-
-    if (tilt < TILT_MIN_NORMAL || tilt > TILT_MAX_NORMAL) {
-        newAlert = CRITICAL;
-    }
+    if (tilt < TILT_MIN_NORMAL || tilt > TILT_MAX_NORMAL) newAlert = CRITICAL;
 
     // Handle alert state change
     unsigned long now = millis();
@@ -211,17 +208,11 @@ void loop() {
         (now - lastTelegramTime > TELEGRAM_INTERVAL)) {
         lastTelegramTime = now;
         String msg = (currentAlert == WARNING) ? "⚠️ WARNING!\n" : "🚨 CRITICAL!\n";
-        msg += "📏 Distance: " + String(distance_cm, 1) + " cm\n";
-        msg += "📐 Tilt: " + String(tilt, 1) + "°";
+        msg += "📏 Distance: " + String(distance_mm, 1) + " mm\n";
+        msg += "📐 Tilt: " + String(tilt, 1) + "°\n";
+        msg += "⏱️ Time: " + getCurrentTime();
         sendTelegram(msg);
     }
-
-    // --- Buzzer ---
-    if (currentAlert == NORMAL) {
-        digitalWrite(BUZZER_PIN, LOW);
-        buzzerState = false;
-    }
-    buzzerPattern(currentAlert);
 
     delay(200);
 }
